@@ -1,0 +1,715 @@
+===============================================================================
+QUERYMIND - DETAILED PROJECT PROGRESS LOG
+===============================================================================
+Covers: Phase 0 through Phase 7 (all complete + verified)
+Last updated: after Phase 7 (connection REST API + MySQL + schema cache)
+
+This document records everything that has been built and decided so far, in
+detail, so anyone can pick the project up without re-reading the whole chat.
+
+
+===============================================================================
+1. WHAT QUERYMIND IS
+===============================================================================
+QueryMind is an MCP (Model Context Protocol) server. It lets any MCP-compatible
+AI client (Claude Desktop, etc.) talk to SQL databases in plain English.
+
+The AI client writes the SQL; QueryMind exposes database "tools" over MCP,
+checks the SQL for safety, runs it against the target database, and returns the
+results. It is multi-tenant (JWT login, per-user database connections) and will
+keep an audit log of every query.
+
+The four product tools (goal):
+  - list_tables      : list tables in a connected DB (+ approx row counts)   [DONE]
+  - describe_table   : show columns/types/nullability of one table           [DONE]
+  - run_query        : run a query safely, return rows + metadata            [DONE]
+  - explain_query    : run EXPLAIN ANALYZE, explain the plan in plain English [DONE]
+
+Two throwaway test tools also exist from Phase 0: ping and echo.
+
+
+===============================================================================
+2. ENVIRONMENT & TOOLING (verified on this machine)
+===============================================================================
+Operating system : Linux (Arch), bash shell
+Java             : OpenJDK 21.0.11
+Maven            : 3.9.16 (via ./mvnw wrapper; wrapper needed chmod +x once)
+Docker           : 29.5.0
+Docker Compose   : 5.1.3
+Postgres image   : postgres:16 (runtime reported 16.14)
+
+IMPORTANT LOCAL QUIRKS (because other things were already running):
+  - The app runs on PORT 8085 (port 8080 was already in use on this machine).
+  - QueryMind's own Postgres is published on HOST PORT 5433 (5432 was taken by
+    another container, "hospital-postgres"). Inside the container it is 5432.
+  - Every time the DB volume is recreated (docker compose down -v), the seeded
+    connection IDs change (they are random UUIDs). Always read the fresh IDs
+    from the app startup log.
+
+
+===============================================================================
+3. DEPENDENCY VERSIONS (resolved from pom.xml, all confirmed real & working)
+===============================================================================
+Spring Boot            : 4.1.0   (parent)
+Spring Framework       : 7.0.8   (pulled in by Boot 4)
+Spring Security        : 7.1.0
+Spring Data JPA        : 4.1.0 / Hibernate ORM 7.4.1.Final
+Spring AI              : 2.0.0   (BOM)
+  - spring-ai-starter-mcp-server-webmvc:2.0.0
+  - spring-ai-mcp-annotations:2.0.0
+  - io.modelcontextprotocol.sdk:mcp:2.0.0
+Jackson                : version 3 (tools.jackson.core 3.1.4) - NOTE: Boot 4
+                         moved to Jackson 3. This is different from Boot 3.
+HikariCP               : 7.0.2
+PostgreSQL JDBC driver : 42.7.11
+MySQL JDBC driver      : com.mysql:mysql-connector-j (version managed by the
+                         Spring Boot 4.1 BOM; added in Phase 7)
+jjwt (JWT)             : 0.12.3   (jjwt-api / jjwt-impl / jjwt-jackson)
+JSqlParser             : 4.7
+Jasypt                 : jasypt-spring-boot-starter 3.0.5 (jasypt core 1.9.3)
+Lombok                 : 1.18.46
+
+KEY API FACTS LEARNED (so future code is correct):
+  - MCP tools use annotations from package org.springframework.ai.mcp.annotation
+      @McpTool(name=..., description=...)
+      @McpToolParam(description=..., required=...)
+    Tools are auto-registered because
+      spring.ai.mcp.server.annotation-scanner.enabled = true (default).
+  - MCP default transport is "streamable" HTTP at POST /mcp.
+  - Spring Boot 4 moved UserDetailsServiceAutoConfiguration to package
+      org.springframework.boot.security.autoconfigure.UserDetailsServiceAutoConfiguration
+  - JSqlParser 4.7:
+      * CCJSqlParserUtil.parse(String) -> single Statement (throws on bad SQL)
+      * CCJSqlParserUtil.parseStatements(String) -> Statements (extends
+        ArrayList<Statement>; use .size()/.get(0) directly - getStatements() is
+        deprecated)
+      * PlainSelect and SetOperationList both extend Select
+      * Select.getLimit() / setLimit(Limit); Limit.setRowCount(new LongValue(n))
+      * Update.getWhere() / Delete.getWhere() return null when no WHERE
+
+
+===============================================================================
+4. HOW THE MCP PROTOCOL IS USED (streamable HTTP)
+===============================================================================
+Endpoint: POST /mcp
+
+Every call must send these headers:
+  Content-Type: application/json
+  Accept: application/json, text/event-stream
+  Authorization: Bearer <token>        (required since Phase 3)
+
+The server replies with Server-Sent Events framing, e.g.:
+  id:<session-id>
+  event:message
+  data:{...json-rpc result...}
+
+Handshake sequence a client follows:
+  1. POST initialize  -> response carries header "Mcp-Session-Id"
+  2. POST notifications/initialized  (with the Mcp-Session-Id header)
+  3. POST tools/list  -> shows all registered tools + input schemas
+  4. POST tools/call  -> actually run a tool
+
+The Mcp-Session-Id header must be sent on every call after initialize.
+
+
+===============================================================================
+5. PROJECT STRUCTURE (all source files and what each does)
+===============================================================================
+Base Java package: dev.querymind.querymind
+
+QuerymindApplication.java
+    Main Spring Boot entry point. Excludes UserDetailsServiceAutoConfiguration
+    so Boot does not create a default user / print a random password (we do our
+    own JWT auth).
+
+config/
+  SecurityConfig.java
+    Spring Security setup. Stateless (no sessions). Permits /auth/**,
+    /actuator/health and /error; everything else needs a valid JWT. Adds the
+    JwtAuthFilter before the username/password filter. Returns 401 when no valid
+    token. Declares the BCryptPasswordEncoder bean.
+  AsyncConfig.java
+    Turns on @Async (@EnableAsync) and defines the "auditExecutor" thread pool
+    (core 2, max 5, queue 100) used only for writing the audit log in the
+    background.
+  DevDataSeeder.java
+    CommandLineRunner. On first startup (only if no connections exist yet) it
+    creates a demo user (demo@querymind.dev / demo12345, bcrypt-hashed) and TWO
+    connections to the sample database: one read-only and one writable. Logs the
+    login details and both connection IDs. Uses a small private helper
+    createSampleConnection(userId, name, readOnly).
+
+controller/
+  AuthController.java
+    REST endpoints: POST /auth/register and POST /auth/login. Both validate the
+    body (@Valid) and return an AuthResponse containing a JWT token.
+  ApiExceptionHandler.java
+    @RestControllerAdvice. Turns IllegalArgumentException into HTTP 400 with a
+    clean {"error": "..."} body, and MethodArgumentNotValidException (bean
+    validation failures) into HTTP 400 with the first field error message.
+  AuditController.java
+    GET /audit -> the logged-in user's own audit history, newest first (tenant-
+    isolated via AuthContext). JWT-protected by the normal security rules.
+  ConnectionController.java
+    REST API for a user's own connections: POST /connections (register),
+    GET /connections (list), DELETE /connections/{id}, POST /connections/{id}/test.
+    JWT-protected, tenant-isolated. Returns ConnectionResponse (never a password).
+
+model/  (JPA entities -> tables via Hibernate ddl-auto=update)
+  User.java          -> table "users"
+  DbConnection.java  -> table "db_connections"
+  QueryAudit.java    -> table "query_audit"    (written on every run_query since
+                        Phase 5; has a nullable "prompt" column for the user's
+                        plain-English question)
+  SchemaCache.java   -> table "schema_cache"   (used since Phase 7: caches the
+                        list_tables result per connection as JSON, 30-min TTL)
+
+repository/  (Spring Data JPA)
+  UserRepository.java           : findByEmail
+  DbConnectionRepository.java   : findByUserId, findByIdAndUserId
+  QueryAuditRepository.java     : findByUserIdOrderByCreatedAtDesc  (for Phase 5)
+  SchemaCacheRepository.java    : findByConnectionId               (for Phase 7)
+
+security/
+  CredentialEncryptor.java
+    Encrypts/decrypts DB passwords with Jasypt AES256TextEncryptor. Master key
+    from property querymind.encryption.key.
+  JwtService.java
+    Creates and reads JWT tokens (HS256). Key from querymind.jwt.secret,
+    lifetime from querymind.jwt.expiration-ms. Subject = userId; also stores
+    email as a claim. getUserId(token) validates signature + expiry.
+  JwtAuthFilter.java
+    OncePerRequestFilter (NOT a Spring bean - it is created inside SecurityConfig
+    so it is not double-registered as a servlet filter). Reads "Authorization:
+    Bearer <token>", validates it, and puts the userId (as the principal) into
+    the SecurityContext. Bad/expired token -> stays unauthenticated.
+  AuthContext.java
+    @Component. getCurrentUserId() reads the userId (UUID) back out of the
+    SecurityContext for the current request. Tools use this to know the caller.
+
+dialect/  (pluggable per-database SQL)
+  DbDialectAdapter.java   : interface { dbType(), jdbcUrl(host,port,db),
+                            listTablesSql(), describeTableSql(), explainSql(sql) }
+  MySqlAdapter.java       : MySQL implementation (added Phase 7). Uses DATABASE()
+                            for the current schema, information_schema tables/
+                            columns aliased to the same column names Postgres
+                            uses (table_name, row_count, ...), and "EXPLAIN " for
+                            explainSql. jdbcUrl = jdbc:mysql://host:port/db.
+  PostgresAdapter.java    : Postgres implementation.
+       listTablesSql   : SELECT c.relname, c.reltuples::bigint FROM pg_class c
+                         JOIN pg_namespace n ... WHERE n.nspname='public'
+                         AND c.relkind='r'  (reltuples = fast, accurate-after-
+                         ANALYZE row estimate)
+       describeTableSql: information_schema.columns filtered by table name (uses
+                         a "?" parameter, not string concatenation)
+       explainSql      : "EXPLAIN ANALYZE " + sql  (used by explain_query)
+
+datasource/
+  DataSourcePool.java
+    @Component. Holds one HikariDataSource per connection ID in a
+    ConcurrentHashMap. getOrCreate(...) builds a pool the first time and reuses
+    it after. Pool max size = 2. If the connection is read-only, the pool is
+    built with config.setReadOnly(true) -> driver-level read-only enforcement.
+    evict(id) closes and removes a pool (used later when a connection is
+    deleted).
+
+service/
+  ConnectionService.java
+    findConnection(connectionId, userId) : looks up a connection ONLY if it
+        belongs to that user (findByIdAndUserId) -> tenant isolation.
+    getAdapter(dbType)                    : picks the matching DbDialectAdapter
+        (Spring injects all adapters as a List).
+    getDataSource(conn)                   : builds the JDBC URL from the adapter,
+        decrypts the password, returns the pooled DataSource.
+    registerConnection(userId, request)   : validates the dbType has an adapter,
+        encrypts the password, saves (added Phase 7).
+    listConnections(userId)               : all of a user's connections.
+    deleteConnection(id, userId)          : ownership-checked delete + evicts the
+        pool and the cached schema.
+    testConnection(id, userId)            : opens a connection and calls
+        Connection.isValid(5); returns TestConnectionResponse; evicts a broken
+        pool on failure.
+  SchemaCacheService.java
+    getTables(connectionId, loader) : returns the cached table list if it is
+        younger than 30 minutes, otherwise calls the loader (a DB read), stores
+        the result as JSON in schema_cache, and returns it. evict(id) drops the
+        cached row. Uses a Jackson 3 JsonMapper; serialize/deserialize failures
+        are treated as a cache miss (best-effort).
+  AuthService.java
+    register(email, password) : rejects duplicate email, bcrypt-hashes the
+        password, saves the user, returns a JWT.
+    login(email, password)    : verifies bcrypt password, returns a JWT.
+  AuditService.java
+    Writes the audit log. Three @Async("auditExecutor") methods: logSuccess,
+    logBlocked, logError. Runs on a background thread so it never slows the
+    query; the actual save() is wrapped in try/catch so an audit failure only
+    logs a warning and is never surfaced to the user.
+  QueryExecutor.java
+    execute(dataSource, sql) : runs an ALREADY-VALIDATED query.
+        - JdbcTemplate with setQueryTimeout(10 seconds).
+        - If the statement is a SELECT with no LIMIT, injects "LIMIT 500" via the
+          JSqlParser AST and marks the result capped.
+        - SELECT -> queryForList (rows). Write (INSERT/UPDATE/DELETE) ->
+          jdbc.update (affected row count).
+        - Returns a QueryResult.
+    explain(dataSource, explainSql) : runs an EXPLAIN statement (same query
+        timeout) and joins the plan text rows into one String.
+  AnthropicClient.java
+    Tiny OPTIONAL client for Claude's /v1/messages API, using Spring's RestClient
+    (no new dependency). isConfigured() is true only when an API key is set.
+    complete(prompt) returns Claude's text answer, or null on any failure (it
+    never throws). Key/model from querymind.anthropic.api-key / .model.
+  ExplanationService.java
+    explain(sql, queryPlan) : if the Anthropic client is configured, asks Claude
+        to explain the plan and suggest indexes; otherwise (or if the call
+        fails) returns the raw plan with a short note. Always returns something
+        useful.
+
+sql/
+  SqlSafetyValidator.java
+    validate(sql, readOnly) -> ValidationResult. Parses the SQL into an AST and
+    decides if it may run (see section 8 for the exact rules).
+  ValidationResult.java
+    record(boolean allowed, String reason). Factory methods allow() and block(
+    reason). (Named allow/block, not allowed/blocked, to avoid clashing with the
+    auto-generated allowed() accessor.)
+
+tool/  (the MCP tools)
+  PingTool.java    : ping -> "pong"; echo(message) -> "You said: ...". Phase 0
+                     test tools.
+  SchemaTools.java : list_tables(connectionId), describe_table(connectionId,
+                     tableName). Each resolves the caller (AuthContext), checks
+                     ownership, gets the DataSource, runs the adapter SQL via
+                     JdbcTemplate. Since Phase 7, list_tables goes through
+                     SchemaCacheService (30-min cache); describe_table stays live.
+  QueryTools.java  : run_query(connectionId, sql, prompt). Resolves caller,
+                     checks ownership, runs the safety validator, and only then
+                     executes via QueryExecutor. A blocked query throws "Query
+                     blocked: <reason>" which the client sees as an error. Every
+                     outcome is recorded via AuditService (BLOCKED / SUCCESS /
+                     ERROR). "prompt" is optional (the user's plain-English
+                     question, stored in the audit log).
+  ExplainTools.java: explain_query(connectionId, sql). Resolves caller, checks
+                     ownership, validates the SQL as read-only so ONLY SELECT is
+                     allowed (EXPLAIN ANALYZE runs the query), runs the adapter's
+                     explainSql, then hands the plan to ExplanationService.
+
+dto/  (tool responses / request bodies, all Java records)
+  TableInfo.java     : (name, rowCount)
+  ColumnInfo.java    : (name, type, nullable)
+  QueryResult.java   : (rows, rowCount, executionMs, resultsCapped, rowLimit)
+  RegisterRequest.java : (email [@Email @NotBlank], password [@NotBlank])
+  LoginRequest.java    : (email [@NotBlank], password [@NotBlank])
+  AuthResponse.java    : (token)
+  CreateConnectionRequest.java : (name, dbType, host, port, databaseName,
+                         username, password, readOnly) - validated. Phase 7.
+  ConnectionResponse.java      : (id, name, dbType, host, port, databaseName,
+                         username, readOnly, createdAt) - NO password. Phase 7.
+  TestConnectionResponse.java  : (ok, message). Phase 7.
+
+
+===============================================================================
+6. CONFIGURATION (src/main/resources/application.properties)
+===============================================================================
+spring.application.name=querymind
+server.port=8085
+
+# MCP server (streamable HTTP transport at POST /mcp)
+spring.ai.mcp.server.name=querymind
+spring.ai.mcp.server.version=0.0.1
+spring.ai.mcp.server.protocol=streamable
+spring.ai.mcp.server.type=sync
+spring.ai.mcp.server.instructions=QueryMind lets you explore and query SQL
+                                   databases in plain English.
+
+# System database (QueryMind's own Postgres, from docker-compose)
+spring.datasource.url=jdbc:postgresql://localhost:5433/querymind
+spring.datasource.username=querymind
+spring.datasource.password=querymind
+
+# Hibernate creates/updates tables from the entity classes
+spring.jpa.hibernate.ddl-auto=update
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+
+# Encrypting stored DB passwords at rest (override in production)
+querymind.encryption.key=${QUERYMIND_ENCRYPTION_KEY:dev-secret-key-change-me}
+
+# JWT login tokens (secret must be >= 32 chars; override in production)
+querymind.jwt.secret=${QUERYMIND_JWT_SECRET:dev-jwt-secret-change-me-0123456789-abcdef}
+querymind.jwt.expiration-ms=86400000   (24 hours)
+
+# Anthropic (OPTIONAL) - enables the AI explanation in explain_query.
+# Empty key => explain_query returns the raw plan instead. Set ANTHROPIC_API_KEY.
+querymind.anthropic.api-key=${ANTHROPIC_API_KEY:}
+querymind.anthropic.model=claude-3-5-sonnet-latest
+
+Production note: always set QUERYMIND_ENCRYPTION_KEY and QUERYMIND_JWT_SECRET
+via environment variables. Set ANTHROPIC_API_KEY too if you want AI explanations.
+
+
+===============================================================================
+7. SYSTEM DATABASE SCHEMA (auto-created by Hibernate)
+===============================================================================
+Four tables in QueryMind's own Postgres (database "querymind"):
+
+users
+    id             UUID  (primary key, generated)
+    email          varchar unique not null
+    password_hash  varchar not null   (bcrypt)
+    created_at     timestamptz not null
+
+db_connections
+    id             UUID  (primary key, generated)
+    user_id        UUID  not null       (owner)
+    name           varchar not null     ("Sample DB (read-only)" etc.)
+    db_type        varchar not null     (POSTGRES / MYSQL / ORACLE)
+    host           varchar not null
+    port           int not null
+    database_name  varchar not null
+    username       varchar not null
+    password_enc   text not null        (Jasypt-encrypted password)
+    read_only      boolean not null
+    created_at     timestamptz not null
+
+query_audit  (written on every run_query since Phase 5)
+    id, user_id, connection_id, sql_executed, prompt (nullable - the user's
+    plain-English question), status (SUCCESS/ERROR/BLOCKED), error_message,
+    execution_ms, row_count, created_at
+
+schema_cache (used since Phase 7: caches the list_tables result, 30-min TTL)
+    id, connection_id, schema_json (the tables list as JSON), cached_at
+
+Separate sample/target databases (what the AI queries in the demo) - NOT part of
+QueryMind itself:
+  PostgreSQL "sampledb" (db/init/01-sampledb.sql), host port 5433:
+    customers(id, name, email, country, created_at)  -> 5 rows
+    orders(id, customer_id -> customers.id, total, status, created_at) -> 8 rows
+    (ANALYZE is run at the end so row-count estimates are accurate immediately)
+  MySQL "sampledb" (db/mysql-init/01-sample.sql), host port 3307, added Phase 7:
+    products(id, name, price, in_stock)  -> 4 rows
+    (used to prove the tools work across database engines)
+
+
+===============================================================================
+8. THE SQL SAFETY LAYER (Phase 4 centerpiece) - EXACT RULES
+===============================================================================
+When run_query is called, the SQL passes through SqlSafetyValidator BEFORE it
+touches the database. Validation is done on the parsed AST (JSqlParser), never
+by text/keyword matching (a word like DROP can hide in comments or column
+names, so text matching is unsafe).
+
+Rules, in order (deny-by-default):
+  1. Must be exactly ONE statement. Blocks injection like
+     "SELECT 1; DROP TABLE customers". (Postgres JDBC would otherwise run both.)
+  2. If it fails to parse -> blocked.
+  3. SELECT (incl. UNION / set operations) -> ALWAYS ALLOWED (read only).
+  4. If the connection is READ-ONLY -> everything except SELECT is blocked.
+  5. INSERT -> allowed (on a writable connection).
+  6. UPDATE -> allowed only if it has a WHERE clause, else blocked.
+  7. DELETE -> allowed only if it has a WHERE clause, else blocked.
+  8. Anything else (DROP, TRUNCATE, ALTER, CREATE, ...) -> blocked.
+
+THREE INDEPENDENT LAYERS OF PROTECTION (defense in depth):
+  A. The AST validator above (application level).
+  B. Hikari pool opened read-only for read-only connections -> the DB driver
+     itself refuses writes, even if the validator had a bug.
+  C. A 10-second query timeout so a slow/expensive query cannot run forever.
+
+AUTOMATIC ROW CAP:
+  - A SELECT with no LIMIT gets "LIMIT 500" injected via the AST.
+  - The response includes resultsCapped:true and rowLimit:500 so the AI can tell
+    the user results were capped.
+  - A SELECT that already has its own LIMIT is left untouched (not capped).
+
+run_query response shape (QueryResult):
+  {
+    "rows": [ {col: value, ...}, ... ],   // empty for writes
+    "rowCount": <int>,                    // rows returned, or rows changed
+    "executionMs": <long>,
+    "resultsCapped": <bool>,
+    "rowLimit": <int or null>             // the cap, when capped
+  }
+
+
+===============================================================================
+9. PHASE-BY-PHASE HISTORY (what was done, decisions, bugs fixed)
+===============================================================================
+
+--- PHASE 0 : FOUNDATION / DE-RISK ------------------------------------------
+Goal: prove the bleeding-edge stack actually works before building features.
+  - Verified Spring Boot 4.1.0 + Spring AI 2.0.0 resolve (they are real).
+  - Learned the correct MCP tool annotations (@McpTool / @McpToolParam) and the
+    streamable HTTP transport at /mcp by inspecting the jars.
+  - Added application.properties MCP config.
+  - Added SecurityConfig (initially permit-all, just to test).
+  - Added PingTool with ping + echo tools.
+  - VERIFIED live: initialize handshake worked, tools/list showed both tools,
+    tools/call ping returned "pong".
+Decision: commit to HTTP/streamable transport (works with JWT + hosting), not
+stdio.
+
+--- PHASE 1 : SYSTEM DATABASE -----------------------------------------------
+Goal: QueryMind's own persistence + encrypted credentials.
+  - docker-compose.yml with postgres:16 (host port 5433).
+  - 4 JPA entities + 4 repositories.
+  - CredentialEncryptor (Jasypt AES).
+  - ddl-auto=update creates the 4 tables on startup.
+  - VERIFIED live: all 4 tables created in Postgres.
+Decision: use JPA ddl-auto=update instead of Flyway, to keep it simple (can add
+Flyway later).
+
+--- PHASE 2 : SCHEMA DISCOVERY TOOLS ----------------------------------------
+Goal: the first real product tools.
+  - DbDialectAdapter interface + PostgresAdapter (pluggable per-DB SQL).
+  - DataSourcePool (HikariCP per connection).
+  - ConnectionService (find connection, pick adapter, build datasource).
+  - list_tables and describe_table tools + TableInfo/ColumnInfo DTOs.
+  - db/init/01-sampledb.sql sample database (customers, orders).
+  - DevDataSeeder seeds a connection to sampledb.
+  - VERIFIED live: list_tables -> customers=5, orders=8; describe_table ->
+    columns; bad connection id -> clean error.
+BUG FOUND & FIXED: first version used pg_stat_user_tables.n_live_tup for row
+counts, which double-counted after insert+ANALYZE (reported 10/16 for 5/8 rows).
+Switched to pg_class.reltuples, which is accurate (5/8).
+
+--- PHASE 3 : JWT AUTH + MULTI-TENANT ---------------------------------------
+Goal: login + strict per-user isolation.
+  - JwtService, JwtAuthFilter, AuthContext.
+  - AuthService + AuthController (/auth/register, /auth/login), bcrypt passwords.
+  - ApiExceptionHandler for clean error responses.
+  - SecurityConfig rewritten: stateless, /mcp requires a valid JWT, 401 when
+    missing.
+  - ConnectionService.findConnection now requires (connectionId, userId) ->
+    ownership check via findByIdAndUserId.
+  - SchemaTools read the current user from AuthContext.
+  - DevDataSeeder gives the demo user a real bcrypt password.
+  - QuerymindApplication excludes UserDetailsServiceAutoConfiguration (kills the
+    "generated security password" log line).
+  - VERIFIED live: login returns JWT; no token -> 401; valid token -> tools work
+    (this also proved the SecurityContext reaches the tool thread); a second
+    user CANNOT use the first user's connection (tenant isolation).
+Design note: JWT reaches the tools via a servlet filter that populates Spring's
+SecurityContext; the sync webmvc MCP transport runs the tool on the request
+thread, so the context is available.
+
+--- POST-PHASE-3 AUDIT (full re-check before Phase 4) -----------------------
+  - Clean build with tests: BUILD SUCCESS, 1 test (contextLoads) passes.
+  - Read every source file for consistency: OK.
+  - Ran 14 runtime checks (auth, all tools, 401s, tenant isolation, error
+    messages).
+BUG FOUND & FIXED: POST /auth/register with a missing password returned 401
+instead of 400. Root cause: bean-validation failure (MethodArgumentNotValid
+Exception) triggered an internal ERROR dispatch to /error, but /error was not
+permitted and Spring Security 6+ filters error dispatches, so it came back as
+401. Fix: (a) added a MethodArgumentNotValidException handler returning a clean
+400, and (b) permitted /error in SecurityConfig so no future unhandled error is
+masked as 401. Re-verified: now returns 400 with a clear message.
+
+--- PHASE 4 : run_query + SQL SAFETY LAYER ----------------------------------
+Goal: safely run AI-written SQL (the technical highlight).
+  - SqlSafetyValidator + ValidationResult (AST rules, section 8).
+  - QueryExecutor + QueryResult (timeout, LIMIT injection, select vs write).
+  - QueryTools -> run_query tool.
+  - DataSourcePool now sets Hikari pool read-only for read-only connections.
+  - DevDataSeeder now seeds TWO connections (read-only + writable) so the safety
+    rules can be tested both ways.
+  - VERIFIED live (full matrix, all passed):
+      Read-only connection:
+        SELECT customers            -> 5 rows, not capped
+        SELECT generate_series 1000 -> 500 rows, resultsCapped=true, rowLimit=500
+        SELECT ... LIMIT 3          -> 3 rows, user limit honored (not capped)
+        DELETE ... WHERE            -> blocked (read-only)
+        DROP TABLE                  -> blocked (read-only)
+      Writable connection:
+        SELECT count               -> works
+        DROP TABLE                 -> blocked (DDL)
+        TRUNCATE                   -> blocked (DDL)
+        DELETE (no WHERE)          -> blocked
+        UPDATE (no WHERE)          -> blocked
+        UPDATE ... WHERE id=1      -> allowed, rowCount=1
+        SELECT 1; DROP TABLE ...   -> blocked (one statement only)
+      Timeout:
+        SELECT pg_sleep(15)        -> cancelled after 10s
+BUGS FOUND & FIXED during Phase 4:
+  1. Record accessor clash: ValidationResult had a component "allowed" (auto
+     accessor allowed()) and a static factory allowed() -> compile error.
+     Renamed factories to allow() / block().
+  2. Deprecation: Statements.getStatements() is deprecated in JSqlParser 4.7.
+     Used the Statements object directly as a List (.size()/.get(0)).
+  - Final clean build: BUILD SUCCESS, test passes, 5 tools registered, no
+    deprecation warnings from our code.
+
+--- PHASE 5 : AUDIT LOG -----------------------------------------------------
+Goal: record every query the AI runs, for review, without slowing anything down.
+  - Added a nullable "prompt" column to QueryAudit (the user's plain-English
+    question, if the client sends it). ddl-auto=update added the column live.
+  - AsyncConfig: @EnableAsync + "auditExecutor" thread pool.
+  - AuditService: @Async logSuccess / logBlocked / logError. Failures are caught
+    and only logged (never surfaced to the user).
+  - QueryTools.run_query now: records BLOCKED before throwing; records SUCCESS
+    (with executionMs + rowCount) after a good run; records ERROR (with the DB
+    error message) then re-throws. Added the optional "prompt" parameter.
+    NOTE: audit happens only AFTER the ownership check passes, so a cross-tenant
+    attempt is not written (there is no valid connection context for it).
+  - AuditController: GET /audit returns the caller's own history, newest first.
+  - VERIFIED live (all passed):
+      SELECT customers          -> audit row SUCCESS, executionMs set, rowCount 5,
+                                   prompt "Show me all customers"
+      DROP on read-only         -> audit row BLOCKED, reason stored, no timing
+      SELECT from missing table -> audit row ERROR, DB error message stored
+      GET /audit (demo user)    -> all three, newest first, prompt included
+      GET /audit (new user)     -> [] (tenant-isolated)
+      The queries still returned normally (async audit never blocked them).
+  - Final clean build: BUILD SUCCESS, test passes, 5 tools registered.
+Design notes:
+  - The audit endpoint is REST (GET /audit), not an MCP tool - admins/users read
+    it directly, they don't need an MCP client.
+  - Every user currently sees only their own log. Role-based "admin sees all" is
+    a future enhancement (we don't have roles yet).
+
+--- PHASE 6 : explain_query -------------------------------------------------
+Goal: answer "why is this query slow?" - run EXPLAIN ANALYZE and explain it.
+  - DbDialectAdapter.explainSql + PostgresAdapter ("EXPLAIN ANALYZE " + sql).
+  - QueryExecutor.explain(dataSource, explainSql): runs it with the query
+    timeout, joins the plan lines into one String.
+  - AnthropicClient: optional Claude client via Spring RestClient (NO new
+    dependency). Never throws; returns null if no key or the call fails.
+  - ExplanationService: builds the prompt, calls Claude, and falls back to the
+    raw plan (with a note) when there is no key or the call fails.
+  - ExplainTools: the explain_query MCP tool. Forces read-only validation so
+    ONLY SELECT is allowed (because EXPLAIN ANALYZE actually executes the query).
+  - application.properties: querymind.anthropic.api-key (from ANTHROPIC_API_KEY,
+    empty by default) + .model.
+DESIGN DECISION (important): the LLM call is OPTIONAL and degrades gracefully.
+  Without a key the app still starts and explain_query returns the real query
+  plan. This keeps the feature complete + the whole app verifiable without a
+  key, and avoids any forced external network call. Matches the spec's "simple
+  REST call" idea, kept dependency-free with RestClient.
+SAFETY: explain_query is SELECT-only. EXPLAIN ANALYZE runs the statement, so a
+  non-SELECT could otherwise cause a write; validating as read-only blocks all
+  non-SELECT (and multi-statements) up front.
+  - VERIFIED live (all passed):
+      tools/list                       -> 6 tools incl. explain_query
+      explain SELECT (join, no key)    -> real EXPLAIN ANALYZE plan returned
+                                          (HashAggregate/Hash Join/Seq Scan +
+                                          actual timings) with the "AI off" note
+      explain DROP (read-only conn)    -> blocked (only SELECT allowed)
+      explain INSERT (WRITABLE conn)   -> blocked (only SELECT allowed) - proves
+                                          writes are refused even where allowed
+      explain "SELECT 1; DROP ..."     -> blocked (one statement only)
+  - Final clean build: BUILD SUCCESS, test passes, 6 tools registered, no
+    deprecation warnings.
+NOT VERIFIED (needs an API key): the actual Claude call. The graceful no-key
+  path (raw plan) is fully verified; the call path is simple and guarded.
+NOTE: explain_query is not written to the audit log (it is a diagnostic tool).
+  Could be added later if desired.
+
+--- PHASE 7 : CONNECTION REST API + MySQL + SCHEMA CACHE --------------------
+Goal: let users register their own databases, support a second engine (MySQL),
+and cache the schema.
+  - Connection DTOs: CreateConnectionRequest (validated), ConnectionResponse (NO
+    password), TestConnectionResponse.
+  - ConnectionService: registerConnection / listConnections / deleteConnection
+    (+ pool & cache evict) / testConnection (Connection.isValid).
+  - ConnectionController: POST/GET/DELETE /connections, POST /connections/{id}/test.
+  - MySqlAdapter + mysql-connector-j (Boot-managed). docker-compose gained a
+    "mysql" service (mysql:8, host port 3307) with db/mysql-init/01-sample.sql
+    (products table). New named volume querymind_mysqldata.
+  - SchemaCacheService: 30-min TTL cache of the table list, stored as JSON in
+    schema_cache; list_tables now goes through it.
+  - QueryExecutor.explain reworked to be multi-dialect: reads the plan as
+    List<Map> and joins each row's values, so it works for Postgres (one text
+    column) AND MySQL (several columns).
+  - VERIFIED live end-to-end (via the REST API + MCP tools):
+      POST /connections (MySQL and Postgres) -> ConnectionResponse, NO password.
+      POST /connections/{id}/test -> {"ok":true,"message":"Connection successful"}
+        for BOTH engines (MySQL connected with a plain jdbc:mysql URL - no extra
+        params needed).
+      MySQL via MySqlAdapter:
+        list_tables    -> products, rowCount 4
+        run_query      -> SELECT * FROM products -> 4 rows with correct data
+        describe_table -> id(int), name(varchar), price(decimal), in_stock(tinyint)
+        explain_query  -> MySQL EXPLAIN rendered by the multi-dialect executor
+      DELETE /connections/{id} -> HTTP 200; the tools then reject that id
+        ("No connection found ... for this user"); GET /connections confirms it
+        is gone. (Pool + cache + row all cleaned up.)
+      list_tables cache: first call loads from the DB and writes schema_cache;
+        second call is served from the cache (same result).
+  - Clean build stays green: BUILD SUCCESS, test passes, 6 tools registered.
+NOTE: the 30-minute cache EXPIRY was not wait-tested (it is a simple timestamp
+  freshness check). Oracle adapter not built (Postgres + MySQL cover the
+  multi-engine story; Oracle would be another DbDialectAdapter).
+SECURITY NOTE: users can register a connection to any host/port they supply, so
+  in a hardened multi-tenant deployment you would add SSRF/allow-list controls.
+  For this project the feature is intentionally open (users bring their own DBs).
+
+
+===============================================================================
+10. CURRENT CAPABILITIES (what works end to end right now)
+===============================================================================
+  - Register / login -> receive a JWT.
+  - Connect an MCP client to POST /mcp with the JWT.
+  - 6 MCP tools registered: ping, echo, list_tables, describe_table, run_query,
+    explain_query.
+  - Manage connections over REST: register / list / test / delete (passwords
+    encrypted, never returned); one user only sees their own.
+  - Works across engines: the same tools query PostgreSQL AND MySQL.
+  - list_tables / describe_table read a connected database's schema (list_tables
+    is served from a 30-minute cache).
+  - run_query runs a query through the safety layer and returns rows + metadata.
+  - Every connection is tenant-isolated (one user cannot use another's).
+  - Read-only connections reject writes at two independent layers.
+  - Dangerous SQL is blocked; large SELECTs are capped at 500 rows and disclosed;
+    queries time out after 10 seconds.
+  - Every run_query is recorded in the audit log (SUCCESS / BLOCKED / ERROR) with
+    SQL, optional prompt, timing and row count, written on a background thread.
+  - GET /audit returns the logged-in user's own query history (tenant-isolated).
+  - explain_query runs EXPLAIN ANALYZE on a SELECT and returns the plan; with an
+    Anthropic API key it also returns a plain-English explanation + index tips.
+  - Passwords for target DBs are stored encrypted (Jasypt); login passwords are
+    bcrypt-hashed.
+
+
+===============================================================================
+11. NOT BUILT YET (upcoming phases)
+===============================================================================
+  Phase 8 : Polish, README architecture diagram, deploy (Railway/Render), demo.
+
+  Possible extras (not required): Oracle adapter, role-based "admin sees all
+  audit", SSRF allow-list for registered connection hosts, wait-tested cache
+  expiry, auditing explain_query.
+
+
+===============================================================================
+12. KNOWN NON-PROBLEMS (benign warnings seen in logs)
+===============================================================================
+  - Spring AI MCP "annotation-scanner" BeanPostProcessorChecker warnings at
+    startup: framework-internal, harmless.
+  - "spring.jpa.open-in-view is enabled by default": cosmetic Boot notice.
+  - Mockito self-attach / Java agent warnings during tests: test-only, harmless.
+  - Jasypt "Converting PropertySource ..." log lines: the starter scanning
+    property sources; we don't use ENC() properties, harmless.
+
+TESTING NOTE: the single test (QuerymindApplicationTests.contextLoads) is a full
+@SpringBootTest, so it needs the Postgres DB running to pass. A CI build would
+need the DB up (docker compose up -d) first.
+
+
+===============================================================================
+13. HOW TO RUN / TEST QUICKLY
+===============================================================================
+  1. docker compose up -d
+  2. ./mvnw spring-boot:run        (or java -jar target/querymind-0.0.1-SNAPSHOT.jar)
+  3. Watch the log for the seeded login + connection IDs.
+  4. Get a token:
+       curl -s -X POST http://localhost:8085/auth/login \
+         -H "Content-Type: application/json" \
+         -d '{"email":"demo@querymind.dev","password":"demo12345"}'
+  5. Use the token on POST /mcp (initialize -> notifications/initialized ->
+     tools/call). Full copy-paste commands are in command.md.
+
+See README.md for the overview and command.md for every command.
+===============================================================================
+END OF DOCUMENT
+===============================================================================

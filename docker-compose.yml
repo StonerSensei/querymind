@@ -1,0 +1,43 @@
+# QueryMind's own database.
+# This stores users, registered database connections and the audit log.
+# It is NOT the database the AI queries - that is registered by users later.
+#
+# Start it with:  docker compose up -d
+services:
+  postgres:
+    image: postgres:16
+    container_name: querymind-postgres
+    environment:
+      POSTGRES_DB: querymind
+      POSTGRES_USER: querymind
+      POSTGRES_PASSWORD: querymind
+    # Host port 5433 (5432 may already be used by another local Postgres).
+    ports:
+      - "5433:5432"
+    volumes:
+      - querymind_pgdata:/var/lib/postgresql/data
+      # SQL files here run automatically the first time the DB is created.
+      # This sets up the "sampledb" sample database for testing.
+      - ./db/init:/docker-entrypoint-initdb.d
+
+  # A second sample database on a DIFFERENT engine (MySQL), to show that the
+  # same tools work across database types. It is a "user database" too - not
+  # part of QueryMind itself.
+  mysql:
+    image: mysql:8
+    container_name: querymind-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: sampledb
+      MYSQL_USER: querymind
+      MYSQL_PASSWORD: querymind
+    # Host port 3307 (3306 may already be used by another local MySQL).
+    ports:
+      - "3307:3306"
+    volumes:
+      - querymind_mysqldata:/var/lib/mysql
+      - ./db/mysql-init:/docker-entrypoint-initdb.d
+
+volumes:
+  querymind_pgdata:
+  querymind_mysqldata:
