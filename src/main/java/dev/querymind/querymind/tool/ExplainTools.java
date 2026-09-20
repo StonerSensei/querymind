@@ -73,7 +73,7 @@ public class ExplainTools {
             String sql) {
 
         UUID userId = authContext.getCurrentUserId();
-        UUID connId = UUID.fromString(connectionId);
+        UUID connId = ToolUtils.parseConnectionId(connectionId);
         DbConnection conn = connectionService.findConnection(connId, userId);
 
         // Force read-only rules so only SELECT is allowed (EXPLAIN ANALYZE runs

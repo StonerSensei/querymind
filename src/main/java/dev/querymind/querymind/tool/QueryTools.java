@@ -57,7 +57,7 @@ public class QueryTools {
             String prompt) {
 
         UUID userId = authContext.getCurrentUserId();
-        UUID connId = UUID.fromString(connectionId);
+        UUID connId = ToolUtils.parseConnectionId(connectionId);
         DbConnection conn = connectionService.findConnection(connId, userId);
 
         // Safety first: reject anything dangerous before we touch the database.

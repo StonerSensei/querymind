@@ -86,8 +86,10 @@ public class ConnectionService {
                         ok ? "Connection successful" : "The database did not confirm the connection");
             }
         } catch (Exception e) {
-            // Don't keep a broken pool around after a failed test.
+            // Don't keep a broken pool or stale schema cache around after a
+            // failed test — both need to be rebuilt on the next attempt.
             dataSourcePool.evict(connectionId);
+            schemaCacheService.evict(connectionId);
             return new TestConnectionResponse(false, "Could not connect: " + e.getMessage());
         }
     }

@@ -47,7 +47,7 @@ public class SchemaTools {
             String connectionId) {
 
         UUID userId = authContext.getCurrentUserId();
-        DbConnection conn = connectionService.findConnection(UUID.fromString(connectionId), userId);
+        DbConnection conn = connectionService.findConnection(ToolUtils.parseConnectionId(connectionId), userId);
 
         // Serve from the 30-minute schema cache if we can; otherwise read the DB.
         return schemaCacheService.getTables(conn.getId(), () -> loadTablesFromDb(conn));
@@ -71,7 +71,7 @@ public class SchemaTools {
             String tableName) {
 
         UUID userId = authContext.getCurrentUserId();
-        DbConnection conn = connectionService.findConnection(UUID.fromString(connectionId), userId);
+        DbConnection conn = connectionService.findConnection(ToolUtils.parseConnectionId(connectionId), userId);
         DbDialectAdapter adapter = connectionService.getAdapter(conn.getDbType());
         DataSource dataSource = connectionService.getDataSource(conn);
 
