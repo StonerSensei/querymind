@@ -44,20 +44,41 @@ Think of it as a safe bridge between an AI assistant and your real databases.
 
 ## Architecture (high level)
 
-```
-Claude Desktop (or any MCP client)
-        |
-        |  MCP over HTTP (streamable), with a JWT token in the header
-        v
-QueryMind MCP Server  (Spring Boot)
-        |
-        |-- JWT check + ownership   --> who are you, and is this your DB?
-        |-- SQL Safety Layer (JSqlParser)  --> checks every query
-        |-- Dynamic DataSource (HikariCP)  --> connects to the user's DB
-        |-- Audit log                      --> records what happened
-        |
-        v
-System DB (PostgreSQL)   users, connections (encrypted), audit log
+```mermaid
+flowchart TD
+    Client["🤖 MCP client\n(Claude Desktop or any MCP client)"]
+
+    subgraph QM["QueryMind  ·  Spring Boot 4.1 + Spring AI 2.0"]
+        Auth["JWT auth + tenant isolation\nEvery request verified · connection ownership checked"]
+
+        subgraph Tools["MCP tools"]
+            T1["list_tables\n30 min cache"]
+            T2["describe_table\nlive"]
+            T3["run_query\n+ audit"]
+            T4["explain_query\n+ schema context + audit"]
+        end
+
+        Safety["SQL safety validator  (JSqlParser AST)\nblocks DDL · multi-statement · WHERE-less DML"]
+        Pool["HikariCP connection pool\nread-only pools enforce read-only at driver level"]
+    end
+
+    SystemDB[("System DB (PostgreSQL)\nusers · connections (encrypted)\naudit log · schema cache")]
+    PG[("PostgreSQL\nuser's database")]
+    MY[("MySQL\nuser's database")]
+    Claude["☁️ Anthropic API\n(optional — explain_query AI summary)"]
+
+    Client -->|"MCP / HTTP + JWT"| Auth
+    Auth --> Tools
+    T3 --> Safety
+    T4 --> Safety
+    Safety --> Pool
+    Pool --> PG
+    Pool --> MY
+    T3 -.->|async audit write| SystemDB
+    T4 -.->|async audit write| SystemDB
+    T1 & T2 --> SystemDB
+    Auth --> SystemDB
+    T4 -.->|explain prompt| Claude
 ```
 
 ---
